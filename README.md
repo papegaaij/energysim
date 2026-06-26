@@ -199,7 +199,30 @@ ship (`--strategy`):
 | `threshold` | A transparent rule of thumb: in the cheapest hours of each window charge (incl. from grid, if allowed) and hold; otherwise discharge to cover load. Needs prices. |
 | `optimal` | Solves the cost-minimising charge/discharge schedule for each window as a **linear program** (PuLP/CBC). The best a controller could do with real day-ahead information — the savings ceiling. Needs prices. |
 
-`--compare` runs all three on the same data/prices and prints a table of net cost and savings.
+The `threshold`/`optimal` strategies optimise the **dynamic** hourly price signal, so they only
+make sense on a dynamic contract — a flat fixed tariff has no hourly spread to arbitrage, and
+pricing their grid trades under one is meaningless (a big battery can show wildly negative
+"fixed savings"). `batterysim` therefore omits the fixed-contract costing for the smart
+strategies; use `--strategy reactive` for the fixed-contract battery scenario.
+
+### `--compare`: the decision matrix
+
+`--compare` runs each contract with its *sensible* control and prints one table, each scenario
+priced on its own contract so the net costs are directly comparable. Give it both fixed prices
+(`--price-*`) and dynamic prices (`--prices`/`--fetch-prices`) to get the full picture —
+including the key real-world question, **fixed + reactive battery vs dynamic + optimal control**:
+
+```
+Scenario comparison (net cost EUR/yr, lower is better; each priced on its own contract):
+  contract control      no battery  with battery  battery saves
+  Fixed    reactive       1,107.68        768.07         339.61
+  Dynamic  reactive         861.62        629.24         232.38
+  Dynamic  threshold        861.62        781.12          80.50
+  Dynamic  optimal          861.62        447.53         414.09  <-- cheapest
+```
+
+(The fixed contract is only paired with `reactive`, since smart strategies don't apply to a flat
+tariff.) With `--no-costs` (or no fixed prices) it shows just the dynamic rows.
 
 ### Realistic foresight (rolling day-ahead window)
 
@@ -371,9 +394,9 @@ the output directory:
   grid-arbitrage / sell-back / curtailment) when a dynamic contract is priced. The CSV gains a
   `solar_curtailed_kwh` column (0 unless `--curtail-solar`).
 
-`--compare` instead writes `…​.strategies.json` (net cost, saving, grid-charged kWh and the
-saving attribution per strategy) and prints the comparison + breakdown tables; it does not
-write the per-hour CSV/PNG.
+`--compare` instead writes `…​.strategies.json` (one entry per scenario: contract, control, net
+cost with/without battery, saving, grid-charged kWh and the saving attribution) and prints the
+scenario matrix + breakdown tables; it does not write the per-hour CSV/PNG.
 
 ## Tests
 

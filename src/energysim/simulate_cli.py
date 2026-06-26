@@ -450,7 +450,7 @@ def _run(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.compare:
-        _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract)
+        _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract, tariff)
         return
 
     strategy_name = args.strategy
@@ -464,7 +464,12 @@ def _run(args: argparse.Namespace) -> None:
         prices=df if contract is not None else None,
     )
     energy = split_by_tariff(result)
-    costs = compute_costs(energy, tariff) if tariff is not None else None
+    # A price-aware strategy optimises the *dynamic* hourly signal, so its grid-trading flows
+    # are meaningless under a flat fixed tariff (which has no hourly spread to arbitrage) — the
+    # fixed-contract cost of those flows would be nonsensically bad. Only price the fixed
+    # contract for the price-agnostic reactive strategy.
+    fixed_applies = strategy_name == "reactive"
+    costs = compute_costs(energy, tariff) if (tariff is not None and fixed_applies) else None
 
     dynamic = compute_dynamic_costs(result, contract) if contract is not None else None
     attribution = attribute_savings(result, efficiency) if dynamic is not None else None
@@ -501,6 +506,13 @@ def _run(args: argparse.Namespace) -> None:
     print(_format_energy_tariff(energy))
     if costs is not None:
         print(_format_costs(costs))
+    if tariff is not None and not fixed_applies:
+        print(
+            f"\nNote: fixed-contract costs are omitted for the '{strategy_name}' strategy. It "
+            "optimises the dynamic hourly price signal, which a flat fixed tariff doesn't have, "
+            "so pricing its grid trades under a fixed contract is not meaningful. Use "
+            "--strategy reactive for the fixed-contract battery scenario."
+        )
     if dynamic is not None:
         print(_format_dynamic_costs(dynamic))
     if costs is not None and dynamic is not None:
@@ -512,21 +524,41 @@ def _run(args: argparse.Namespace) -> None:
     print(f"Summary: {summary_path}")
 
 
-def _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract) -> None:
-    """Run all strategies on the same data/prices and report a comparison."""
-    results = {}
+def _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract, tariff) -> None:
+    """Report a decision matrix: each contract run with its sensible control strategy.
+
+    Smart strategies only make sense on the dynamic contract; the fixed contract is paired with
+    the reactive (self-consumption) battery, which is the right control for a flat tariff. Each
+    scenario is priced under its own contract, so the net costs are directly comparable.
+    """
     attributions = {}
+    dyn_results = {}
     for name in ("reactive", "threshold", "optimal"):
         params = _battery_params(args, capacity, efficiency, name)
-        print(f"Simulating [{name}] ...")
+        print(f"Simulating dynamic [{name}] ...")
         result, summary = simulate_battery(
             df, params, make_strategy(name, cycle_cost=args.cycle_cost), prices=df
         )
-        results[name] = (summary, compute_dynamic_costs(result, contract))
+        dyn_results[name] = (result, summary, compute_dynamic_costs(result, contract))
         attributions[name] = attribute_savings(result, efficiency)
 
-    no_battery = results["reactive"][1].net_without_eur
-    print(_format_strategy_comparison(no_battery, results))
+    scenarios = []
+    if tariff is not None:
+        # Fixed contract: only the reactive battery is meaningful (no hourly spread to arbitrage).
+        fixed = compute_costs(split_by_tariff(dyn_results["reactive"][0]), tariff)
+        scenarios.append(
+            {"contract": "Fixed", "control": "reactive",
+             "without": fixed.net_without_eur, "with": fixed.net_with_eur, "grid_charged": 0.0}
+        )
+    for name in ("reactive", "threshold", "optimal"):
+        _, summ, dyn = dyn_results[name]
+        scenarios.append(
+            {"contract": "Dynamic", "control": name,
+             "without": dyn.net_without_eur, "with": dyn.net_with_eur,
+             "grid_charged": summ.total_grid_charged_kwh}
+        )
+
+    print(_format_scenario_comparison(scenarios))
     print(_format_attribution_table(attributions))
 
     stem = _output_stem(input_path, capacity, efficiency)
@@ -537,17 +569,21 @@ def _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract) 
                 "input": str(input_path),
                 "capacity_kwh": capacity,
                 "efficiency": efficiency,
-                "no_battery_net_eur": round(no_battery, 2),
-                "strategies": {
-                    name: {
-                        "net_with_eur": round(dyn.net_with_eur, 2),
-                        "saving_vs_no_battery_eur": round(no_battery - dyn.net_with_eur, 2),
-                        "grid_charged_kwh": round(summ.total_grid_charged_kwh, 1),
-                        "grid_discharged_kwh": round(summ.total_grid_discharged_kwh, 1),
-                        "saving_attribution": attributions[name].as_dict(),
+                "scenarios": [
+                    {
+                        "contract": s["contract"],
+                        "control": s["control"],
+                        "no_battery_net_eur": round(s["without"], 2),
+                        "with_battery_net_eur": round(s["with"], 2),
+                        "battery_saving_eur": round(s["without"] - s["with"], 2),
+                        "grid_charged_kwh": round(s["grid_charged"], 1),
+                        "saving_attribution": (
+                            attributions[s["control"]].as_dict()
+                            if s["contract"] == "Dynamic" else None
+                        ),
                     }
-                    for name, (summ, dyn) in results.items()
-                },
+                    for s in scenarios
+                ],
             },
             indent=2,
         ),
@@ -556,18 +592,18 @@ def _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract) 
     print(f"\nWrote comparison to {out_path}")
 
 
-def _format_strategy_comparison(no_battery: float, results: dict) -> str:
-    best = min(results, key=lambda n: results[n][1].net_with_eur)
+def _format_scenario_comparison(scenarios: list) -> str:
+    best = min(range(len(scenarios)), key=lambda i: scenarios[i]["with"])
     lines = [
-        "\nBattery strategy comparison (dynamic contract, net cost = import - export):",
-        f"  {'No battery':<12}{no_battery:>12,.2f} EUR",
-        f"  {'strategy':<12}{'net EUR':>12}{'saving':>12}{'grid-charged':>15}",
+        "\nScenario comparison (net cost EUR/yr, lower is better; each priced on its own contract):",
+        f"  {'contract':<9}{'control':<11}{'no battery':>12}{'with battery':>14}"
+        f"{'battery saves':>15}",
     ]
-    for name, (summ, dyn) in results.items():
-        mark = "  <-- best" if name == best else ""
+    for i, s in enumerate(scenarios):
+        mark = "  <-- cheapest" if i == best else ""
         lines.append(
-            f"  {name:<12}{dyn.net_with_eur:>12,.2f}{no_battery - dyn.net_with_eur:>12,.2f}"
-            f"{summ.total_grid_charged_kwh:>13,.0f} kWh{mark}"
+            f"  {s['contract']:<9}{s['control']:<11}{s['without']:>12,.2f}{s['with']:>14,.2f}"
+            f"{s['without'] - s['with']:>15,.2f}{mark}"
         )
     return "\n".join(lines)
 
