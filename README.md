@@ -149,6 +149,13 @@ batterysim --input data/energy_2025-03-01_2026-02-28.csv --capacity 10 --efficie
 | `--feed-in-factor` | Share of the bare market price paid for export (default `1.0`). |
 | `--energy-tax` | 2027 energy tax, EUR/kWh excl. BTW (default `0.0916`, see below).|
 | `--feed-in-incl-vat` | Add BTW to the export feed-in compensation.               |
+| `--strategy`   | Battery control: `reactive` (default), `threshold`, or `optimal`. |
+| `--compare`    | Run all three strategies and print a comparison table.          |
+| `--grid-charge` / `--no-grid-charge` | Allow charging from the grid (default: on for smart strategies). |
+| `--grid-discharge` / `--no-grid-discharge` | Allow selling to the grid (default: off). |
+| `--max-charge-kw` / `--max-discharge-kw` | Battery power limits in kW (default: unlimited). |
+| `--cycle-cost` | Battery wear cost per kWh of throughput, EUR/kWh (default `0`).  |
+| `--curtail-solar` | Throttle solar instead of exporting at a negative price (needs prices). |
 
 Fixed-contract prices are prompted if not given as flags (press Enter at the first price
 prompt to skip costs); provide either all four `--price-*` values or none. The dynamic
@@ -175,24 +182,94 @@ Assumptions:
 - The battery **starts empty**; charging is 100% efficient and the **round-trip efficiency is
   applied on discharge** (the loss happens when you consume from the battery).
 - Each hour charges first, then discharges, so same-hour surplus can serve same-hour load.
-- The battery only charges from **solar surplus** and only discharges to **cover load** — no
-  charging from the grid, and **no charge/discharge power limit** (capacity-bound only).
+- This describes the default `reactive` strategy (below). It only charges from **solar
+  surplus** and only discharges to **cover load** — no grid trading, no power limit.
 
-### Pluggable charge/discharge strategies
+## Battery strategies
 
 The *decision* of how much to charge/discharge each hour is a swappable component
 (`BatteryStrategy` in `src/energysim/simulate.py`); the engine only does the physical
-accounting (state of charge, capacity/power limits, efficiency losses) and turns a strategy's
-intent into the resulting grid flows. The only strategy shipped today is `ReactiveStrategy`,
-which reproduces the behaviour above.
+accounting (state of charge, capacity/power limits, round-trip losses) via the shared
+`apply_step`, and turns a strategy's intent into the resulting grid flows. Three strategies
+ship (`--strategy`):
 
-The plumbing is already in place for smarter models: a strategy receives the day-ahead
-`import_price`/`export_price` series for the whole period (so it can look ahead), and
-`BatteryParams` carries `allow_grid_charge`, `allow_grid_discharge` and per-step power limits.
-A future price-aware strategy can therefore **charge from the grid when prices are low and
-discharge onto the grid when they are high** — the `battery_grid_charge_kwh` /
-`battery_grid_discharge_kwh` output columns and the dynamic pricing already account for such
-grid trades. (Today, with the reactive model, those columns are always `0`.)
+| Strategy | What it does |
+|---|---|
+| `reactive` (default) | Self-consumption only: charge from solar surplus, discharge to cover load, never trade with the grid. Needs no prices. |
+| `threshold` | A transparent rule of thumb: in the cheapest hours of each window charge (incl. from grid, if allowed) and hold; otherwise discharge to cover load. Needs prices. |
+| `optimal` | Solves the cost-minimising charge/discharge schedule for each window as a **linear program** (PuLP/CBC). The best a controller could do with real day-ahead information — the savings ceiling. Needs prices. |
+
+`--compare` runs all three on the same data/prices and prints a table of net cost and savings.
+
+### Realistic foresight (rolling day-ahead window)
+
+The smart strategies mirror real systems ([EMHASS](https://emhass.readthedocs.io/),
+[Predbat](https://www.predbat.com/), Victron Dynamic ESS): day-ahead prices publish ~13:00 for
+the next day, so at any moment a strategy may only use prices **through the end of tomorrow**.
+They re-plan each day at 13:00 and carry the state of charge forward (Model Predictive
+Control). Within a window, load/solar are taken as **known** (a perfect load/solar forecast) —
+a deliberate simplification; only price foresight is realistically limited.
+
+The `optimal` LP minimises `Σ import·import_price − export·export_price` (+ optional
+`--cycle-cost`) subject to SoC continuity/bounds, power limits and the efficiency model, with a
+terminal value on left-over SoC so it doesn't dump the battery for free at each window edge
+(zeroed at the true end of the data). No integer variables are needed because the import price
+always exceeds the export price here, so simultaneous charge+discharge is never profitable.
+
+### Grid trading is configurable
+
+`--grid-charge`/`--grid-discharge` (default: charge on, sell off for smart strategies; both off
+for reactive) gate whether the battery may buy from / sell to the grid — exactly the toggles
+EMHASS/Predbat/DESS expose. Grid trades appear in the `battery_grid_charge_kwh` /
+`battery_grid_discharge_kwh` columns and are priced automatically. Note that enabling them only
+*permits* trading; the reactive strategy never trades regardless. And because import always
+costs more than export pays here, "buy from grid to resell to grid" is essentially never
+profitable — the gains are "buy cheap grid energy to cover your own later load" and "sell
+genuinely surplus solar at peak hours" (which only `optimal` exploits well).
+
+### Curtailing solar at negative prices
+
+On a dynamic contract the market price goes **negative** for a chunk of the year (~580 hours
+in this dataset), and exporting then *costs* you a fee. `--curtail-solar` throttles the
+panels in those hours so the **leftover** surplus — what's left after the home and the battery
+have taken their share — isn't dumped to the grid at a loss. It works with any strategy
+(including `reactive`) and shows up as the `solar_curtailed_kwh` column and a `curtailment`
+term in the saving breakdown. Note the interaction with the battery: `optimal` curtails little
+(it soaks up cheap/negative-price surplus into the battery instead), while `reactive` curtails
+more because it can't.
+
+### Where the saving comes from (saving attribution)
+
+Every run that prices a dynamic contract also reports an **exact decomposition** of the
+battery's saving (vs no battery) into three channels — so you can see *why* a strategy wins or
+loses — plus a small leftover term for energy still in the battery at the end. The three
+channels reconcile to the total saving (FIFO lot accounting in `dynamic_pricing.attribute_savings`):
+
+- **Self-consumption** — stored *solar* used to cover load (avoided import minus forgone export).
+- **Grid arbitrage** — energy bought *from the grid* in cheap hours to cover later load.
+- **Sell-back** — energy discharged to the grid (sale revenue minus its charging cost).
+- **Curtailment** — export fee avoided by throttling solar (only with `--curtail-solar`).
+
+`--compare` prints a per-strategy breakdown table. A real example (10 kWh, selling enabled)
+makes the story obvious — the naive heuristic wins on sell-back but wrecks self-consumption,
+while `optimal` keeps self-consumption *and* adds the other two:
+
+```
+Saving by source (EUR, dynamic contract):
+  strategy      self-consum   grid-arb  sell-back     total
+  reactive           232.38       0.00       0.00    232.38
+  threshold           37.42       3.39      39.69     80.50
+  optimal            238.40      44.32     131.37    414.09
+```
+
+### A note on what these reveal
+
+Don't assume "smart = cheaper". For a **solar-heavy** home, plain `reactive` self-consumption
+already captures most of the value; the simple `threshold` rule often only ties it (or slightly
+trails — deferring discharge can waste stored solar). The real, sizeable gains come from
+`optimal` (genuine look-ahead optimisation) — which is exactly why tools like EMHASS and
+Predbat exist rather than naive automations. `threshold` shines mainly on **grid arbitrage in
+low-solar periods**. Run `--compare` on your own data to see which is true for you.
 
 ## Tariffs: energy and costs per tariff
 
@@ -288,9 +365,15 @@ the output directory:
 - `…​.png` — a chart with grid totals (with vs without), battery state of charge over time, and
   a monthly import/export breakdown; with a dynamic contract a fourth panel shows the monthly
   average import / export / market prices.
-- `…​.summary.json` — energy totals, reductions, self-sufficiency, the per-tariff energy split,
-  the fixed-contract `costs` (when fixed prices are given) and the `dynamic_costs` breakdown
-  (when a dynamic contract is priced).
+- `…​.summary.json` — the `strategy` used, energy totals, reductions, self-sufficiency, the
+  per-tariff energy split, the fixed-contract `costs` (when fixed prices are given), the
+  `dynamic_costs` breakdown and the `dynamic_savings_attribution` (self-consumption /
+  grid-arbitrage / sell-back / curtailment) when a dynamic contract is priced. The CSV gains a
+  `solar_curtailed_kwh` column (0 unless `--curtail-solar`).
+
+`--compare` instead writes `…​.strategies.json` (net cost, saving, grid-charged kWh and the
+saving attribution per strategy) and prints the comparison + breakdown tables; it does not
+write the per-hour CSV/PNG.
 
 ## Tests
 

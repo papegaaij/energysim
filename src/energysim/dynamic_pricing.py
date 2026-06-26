@@ -22,6 +22,7 @@ cannot exist yet); this is a stated assumption.
 from __future__ import annotations
 
 import warnings
+from collections import deque
 from dataclasses import dataclass
 
 import pandas as pd
@@ -217,3 +218,104 @@ def add_cost_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["import_cost_eur"] = (_col(df, "grid_import_sim_kwh") * _col(df, IMPORT_PRICE_COL)).round(6)
     out["export_cost_eur"] = (_col(df, "grid_export_sim_kwh") * _col(df, EXPORT_PRICE_COL)).round(6)
     return out
+
+
+@dataclass
+class SavingsAttribution:
+    """The dynamic-contract battery saving (vs no battery), split by the channel it came from.
+
+    The three channels plus the leftover term sum **exactly** to the dynamic ``savings_eur``:
+
+    - ``self_consumption_eur`` — stored *solar* used to cover load (avoided import minus the
+      export it would otherwise have earned).
+    - ``grid_arbitrage_eur`` — energy bought *from the grid* in cheap hours and used to cover
+      load later (avoided import minus the grid-charging cost).
+    - ``sell_back_eur`` — energy discharged to the grid (sale revenue minus its charging cost).
+    - ``curtailment_eur`` — fee avoided by throttling solar instead of exporting at a negative
+      price (not a battery action, but part of the dynamic saving).
+    - ``unused_end_soc_eur`` — charge cost of energy still in the battery at the end (≤ 0).
+    """
+
+    self_consumption_eur: float
+    grid_arbitrage_eur: float
+    sell_back_eur: float
+    curtailment_eur: float
+    unused_end_soc_eur: float
+
+    @property
+    def total_eur(self) -> float:
+        return (
+            self.self_consumption_eur
+            + self.grid_arbitrage_eur
+            + self.sell_back_eur
+            + self.curtailment_eur
+            + self.unused_end_soc_eur
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "self_consumption_eur": round(self.self_consumption_eur, 2),
+            "grid_arbitrage_eur": round(self.grid_arbitrage_eur, 2),
+            "sell_back_eur": round(self.sell_back_eur, 2),
+            "curtailment_eur": round(self.curtailment_eur, 2),
+            "unused_end_soc_eur": round(self.unused_end_soc_eur, 2),
+            "total_eur": round(self.total_eur, 2),
+        }
+
+
+def attribute_savings(df: pd.DataFrame, efficiency: float) -> SavingsAttribution:
+    """Attribute the battery's dynamic-contract saving to its three channels via FIFO lots.
+
+    Each charged kWh becomes a "lot" tagged with its source and cost-per-kWh-in-cell (a grid
+    lot costs that hour's import price; a solar lot costs that hour's forgone export). When the
+    battery discharges, energy is drawn FIFO and the realised value (avoided import, or sale
+    revenue) minus the lot's charge cost is booked to the matching channel. The three channels
+    plus the end-of-data leftover reconcile to the total saving.
+    """
+    imp = _col(df, IMPORT_PRICE_COL)
+    exp = _col(df, EXPORT_PRICE_COL)
+    charge_total = _col(df, "battery_charge_kwh")
+    charge_grid = _col(df, "battery_grid_charge_kwh")
+    disch_total = _col(df, "battery_discharge_kwh")
+    disch_grid = _col(df, "battery_grid_discharge_kwh")
+
+    # Fee avoided by curtailing solar instead of exporting at a negative price.
+    curtailed = _col(df, "solar_curtailed_kwh") if "solar_curtailed_kwh" in df.columns else None
+    curtailment = float(-(curtailed * exp).sum()) if curtailed is not None else 0.0
+
+    lots: deque[list[float]] = deque()  # [remaining_cell_kwh, cost_per_cell_kwh, is_grid]
+    self_c = arbitrage = sell = 0.0
+    eps = 1e-12
+
+    for i in range(len(df)):
+        solar_charge = charge_total[i] - charge_grid[i]
+        if solar_charge > eps:
+            lots.append([solar_charge, exp[i], False])  # solar lot: cost = forgone export
+        if charge_grid[i] > eps:
+            lots.append([charge_grid[i], imp[i], True])  # grid lot: cost = import price
+
+        to_load = disch_total[i] - disch_grid[i]
+        to_grid = disch_grid[i]
+
+        for delivered, selling in ((to_load, False), (to_grid, True)):
+            if delivered <= eps:
+                continue
+            need = delivered / efficiency  # cell energy drawn for this delivery
+            while need > eps and lots:
+                lot = lots[0]
+                take = min(lot[0], need)
+                value = take * efficiency * (exp[i] if selling else imp[i])
+                cost = take * lot[1]
+                if selling:
+                    sell += value - cost
+                elif lot[2]:
+                    arbitrage += value - cost
+                else:
+                    self_c += value - cost
+                lot[0] -= take
+                need -= take
+                if lot[0] <= eps:
+                    lots.popleft()
+
+    unused = -sum(lot[0] * lot[1] for lot in lots)
+    return SavingsAttribution(self_c, arbitrage, sell, curtailment, unused)

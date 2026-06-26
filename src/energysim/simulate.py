@@ -49,6 +49,8 @@ SIM_COLUMNS = [
     # price-aware strategies). Kept in the output so trades are visible and priceable.
     "battery_grid_charge_kwh",
     "battery_grid_discharge_kwh",
+    # Solar throttled back to avoid exporting at a negative price (0 unless curtailment is on).
+    "solar_curtailed_kwh",
 ]
 
 
@@ -70,6 +72,9 @@ class BatteryParams:
     max_discharge_kwh_per_step: float | None = None
     allow_grid_charge: bool = False
     allow_grid_discharge: bool = False
+    # Throttle solar back when the export price is negative, so the leftover surplus (after
+    # self-consumption and battery charging) isn't exported at a loss. Needs per-hour prices.
+    curtail_negative_export: bool = False
 
 
 @dataclass
@@ -106,18 +111,28 @@ class StepDecision:
 
 
 class BatteryStrategy(Protocol):
-    """Decides one hour's charge/discharge given the current :class:`StepContext`."""
+    """Decides one hour's charge/discharge given the current :class:`StepContext`.
+
+    ``plan`` is an optional lifecycle hook the engine calls once before the per-step loop, so
+    a horizon-based strategy can precompute a whole-period schedule from the price/flow columns
+    on ``df``. Per-step strategies leave it as a no-op.
+    """
+
+    def plan(self, df: pd.DataFrame, params: "BatteryParams") -> None: ...
 
     def decide(self, ctx: StepContext) -> StepDecision: ...
 
 
 @dataclass
 class ReactiveStrategy:
-    """The only strategy shipped today: fully reactive, no grid trading.
+    """The only purely-reactive strategy: self-consumption, no grid trading.
 
     Charge from all available solar surplus, then discharge to cover all household demand.
     The engine caps both to what fits / is deliverable, so stating the raw amounts is enough.
     """
+
+    def plan(self, df: pd.DataFrame, params: "BatteryParams") -> None:
+        """Reactive needs no look-ahead planning."""
 
     def decide(self, ctx: StepContext) -> StepDecision:
         return StepDecision(
@@ -145,6 +160,8 @@ class Summary:
     # Battery <-> grid energy (0 for the reactive model).
     total_grid_charged_kwh: float = 0.0
     total_grid_discharged_kwh: float = 0.0
+    # Solar throttled to avoid loss-making export (0 unless curtailment is enabled).
+    total_curtailed_kwh: float = 0.0
     # Self-sufficiency = share of household load not drawn from the grid (None if the input
     # has no home_consumption_kwh column).
     self_sufficiency_without: float | None = None
@@ -163,6 +180,74 @@ def _price_array(prices: pd.DataFrame | None, column: str, n: int) -> np.ndarray
         return None
     arr = prices[column].to_numpy(dtype=float)
     return arr if len(arr) == n else None
+
+
+@dataclass
+class StepResult:
+    """The physical outcome of applying one :class:`StepDecision` to the battery."""
+
+    charge_from_surplus: float
+    charge_from_grid: float
+    discharge_to_load: float
+    discharge_to_grid: float
+    new_soc: float
+    loss: float
+    grid_import: float
+    grid_export: float
+
+    @property
+    def charged(self) -> float:
+        return self.charge_from_surplus + self.charge_from_grid
+
+    @property
+    def delivered(self) -> float:
+        return self.discharge_to_load + self.discharge_to_grid
+
+
+def apply_step(
+    soc: float, surplus: float, deficit: float, decision: StepDecision, params: BatteryParams
+) -> StepResult:
+    """Apply one hour's decision under the physical constraints; the single source of truth.
+
+    Charge from surplus first (free), then grid; clamp to remaining capacity and the charge
+    power limit. Then discharge to load first, then grid; clamp to deliverable energy
+    (``soc * efficiency``) and the discharge power limit. The round-trip loss is taken on
+    discharge. Both the engine loop and the look-ahead strategies use this, so a planned SoC
+    trajectory always matches the simulated one.
+    """
+    efficiency = params.efficiency
+
+    from_surplus = min(max(decision.charge_from_surplus, 0.0), surplus)
+    from_grid = max(decision.charge_from_grid, 0.0) if params.allow_grid_charge else 0.0
+    room = max(params.capacity_kwh - soc, 0.0)
+    allowed_charge = min(from_surplus + from_grid, room)
+    if params.max_charge_kwh_per_step is not None:
+        allowed_charge = min(allowed_charge, params.max_charge_kwh_per_step)
+    from_surplus = min(from_surplus, allowed_charge)
+    from_grid = allowed_charge - from_surplus
+    soc += allowed_charge
+
+    to_load = min(max(decision.discharge_to_load, 0.0), deficit)
+    to_grid = max(decision.discharge_to_grid, 0.0) if params.allow_grid_discharge else 0.0
+    deliverable = soc * efficiency
+    allowed_discharge = min(to_load + to_grid, deliverable)
+    if params.max_discharge_kwh_per_step is not None:
+        allowed_discharge = min(allowed_discharge, params.max_discharge_kwh_per_step)
+    to_load = min(to_load, allowed_discharge)
+    to_grid = allowed_discharge - to_load
+    delivered = allowed_discharge
+    soc -= delivered / efficiency
+
+    return StepResult(
+        charge_from_surplus=from_surplus,
+        charge_from_grid=from_grid,
+        discharge_to_load=to_load,
+        discharge_to_grid=to_grid,
+        new_soc=soc,
+        loss=delivered * (1.0 / efficiency - 1.0),
+        grid_import=deficit - to_load + from_grid,
+        grid_export=surplus - from_surplus + to_grid,
+    )
 
 
 def simulate_battery(
@@ -193,6 +278,9 @@ def simulate_battery(
     if params.capacity_kwh < 0:
         raise SimulationError("Capacity must be >= 0.")
 
+    # Let a horizon-based strategy precompute its schedule before the per-step loop.
+    strategy.plan(df, params)
+
     imports = df[IMPORT_COL].fillna(0.0).to_numpy(dtype=float)
     exports = df[EXPORT_COL].fillna(0.0).to_numpy(dtype=float)
     n = len(df)
@@ -202,8 +290,6 @@ def simulate_battery(
 
     capacity = params.capacity_kwh
     efficiency = params.efficiency
-    max_charge = params.max_charge_kwh_per_step
-    max_discharge = params.max_discharge_kwh_per_step
 
     charge = [0.0] * n
     discharge = [0.0] * n
@@ -213,6 +299,10 @@ def simulate_battery(
     export_sim = [0.0] * n
     grid_charge = [0.0] * n
     grid_discharge = [0.0] * n
+    curtailed = [0.0] * n
+
+    # Solar can only be throttled to dodge a fee if we know the (negative) export price.
+    curtail = params.curtail_negative_export and export_price is not None
 
     soc = 0.0
     for i in range(n):
@@ -231,38 +321,25 @@ def simulate_battery(
             )
         )
 
-        # --- Charge: surplus first (free), then grid (only if allowed). ---
-        from_surplus = min(max(decision.charge_from_surplus, 0.0), surplus)
-        from_grid = max(decision.charge_from_grid, 0.0) if params.allow_grid_charge else 0.0
-        room = max(capacity - soc, 0.0)
-        allowed_charge = min(from_surplus + from_grid, room)
-        if max_charge is not None:
-            allowed_charge = min(allowed_charge, max_charge)
-        from_surplus = min(from_surplus, allowed_charge)
-        from_grid = allowed_charge - from_surplus
-        soc += allowed_charge
+        res = apply_step(soc, surplus, deficit, decision, params)
+        soc = res.new_soc
 
-        # --- Discharge: load first, then grid (only if allowed). `delivered` is energy
-        #     leaving the battery terminals; the round-trip loss is applied here. ---
-        to_load = min(max(decision.discharge_to_load, 0.0), deficit)
-        to_grid = max(decision.discharge_to_grid, 0.0) if params.allow_grid_discharge else 0.0
-        deliverable = soc * efficiency
-        allowed_discharge = min(to_load + to_grid, deliverable)
-        if max_discharge is not None:
-            allowed_discharge = min(allowed_discharge, max_discharge)
-        to_load = min(to_load, allowed_discharge)
-        to_grid = allowed_discharge - to_load
-        delivered = allowed_discharge
-        soc -= delivered / efficiency
+        exported = res.grid_export
+        # Curtail the leftover surplus rather than export it at a negative price. Load and
+        # battery charging already took their share in apply_step, so only loss-making export
+        # is thrown away.
+        if curtail and exported > 0.0 and export_price[i] < 0.0:
+            curtailed[i] = exported
+            exported = 0.0
 
-        charge[i] = allowed_charge
-        discharge[i] = delivered
+        charge[i] = res.charged
+        discharge[i] = res.delivered
         soc_series[i] = soc
-        loss[i] = delivered * (1.0 / efficiency - 1.0)
-        grid_charge[i] = from_grid
-        grid_discharge[i] = to_grid
-        import_sim[i] = deficit - to_load + from_grid
-        export_sim[i] = surplus - from_surplus + to_grid
+        loss[i] = res.loss
+        grid_charge[i] = res.charge_from_grid
+        grid_discharge[i] = res.discharge_to_grid
+        import_sim[i] = res.grid_import
+        export_sim[i] = exported
 
     out = df.copy()
     out["battery_charge_kwh"] = charge
@@ -273,6 +350,7 @@ def simulate_battery(
     out["grid_export_sim_kwh"] = export_sim
     out["battery_grid_charge_kwh"] = grid_charge
     out["battery_grid_discharge_kwh"] = grid_discharge
+    out["solar_curtailed_kwh"] = curtailed
     out[SIM_COLUMNS] = out[SIM_COLUMNS].round(6)
 
     import_without = float(imports.sum())
@@ -303,6 +381,7 @@ def simulate_battery(
         end_soc_kwh=soc,
         total_grid_charged_kwh=float(sum(grid_charge)),
         total_grid_discharged_kwh=float(sum(grid_discharge)),
+        total_curtailed_kwh=float(sum(curtailed)),
         self_sufficiency_without=(
             (1.0 - import_without / consumption) if consumption else None
         ),

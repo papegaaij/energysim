@@ -16,8 +16,10 @@ from energysim.dynamic_pricing import (
     DEFAULT_MARKUP_EUR,
     DynamicContract,
     DynamicCostBreakdown,
+    SavingsAttribution,
     add_cost_columns,
     add_price_columns,
+    attribute_savings,
     compute_dynamic_costs,
 )
 from energysim.prices import (
@@ -42,11 +44,11 @@ from energysim.prompts import (
 )
 from energysim.simulate import (
     BatteryParams,
-    ReactiveStrategy,
     SimulationError,
     Summary,
     simulate_battery,
 )
+from energysim.strategies import STRATEGIES, make_strategy
 from energysim.timeutil import local_timestamps
 
 
@@ -99,7 +101,54 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feed-in-incl-vat", action="store_true",
         help="Add BTW to the feed-in compensation for export.",
     )
+
+    # Battery charge/discharge strategy.
+    parser.add_argument(
+        "--strategy", choices=sorted(STRATEGIES), default="reactive",
+        help="Battery control strategy (default: reactive). 'threshold'/'optimal' need prices.",
+    )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="Run reactive, threshold and optimal and print a comparison table (needs prices).",
+    )
+    parser.add_argument(
+        "--grid-charge", action=argparse.BooleanOptionalAction, default=None,
+        help="Allow charging the battery from the grid (default: on for smart strategies).",
+    )
+    parser.add_argument(
+        "--grid-discharge", action=argparse.BooleanOptionalAction, default=None,
+        help="Allow selling battery energy back to the grid (default: off).",
+    )
+    parser.add_argument("--max-charge-kw", type=float, help="Max charge power (kW); default unlimited.")
+    parser.add_argument("--max-discharge-kw", type=float, help="Max discharge power (kW); default unlimited.")
+    parser.add_argument(
+        "--cycle-cost", type=float, default=0.0,
+        help="Battery wear cost per kWh of throughput (EUR/kWh) for smart strategies (default 0).",
+    )
+    parser.add_argument(
+        "--curtail-solar", action="store_true",
+        help="Throttle solar instead of exporting at a negative price (needs prices). "
+        "Works with any strategy, including reactive.",
+    )
     return parser.parse_args(argv)
+
+
+def _battery_params(args: argparse.Namespace, capacity: float, efficiency: float, strategy_name: str) -> BatteryParams:
+    """Build BatteryParams, defaulting grid trading on/off per strategy unless flags override."""
+    smart = strategy_name != "reactive"
+    grid_charge = args.grid_charge if args.grid_charge is not None else smart
+    grid_discharge = args.grid_discharge if args.grid_discharge is not None else False
+    if not smart:  # the reactive model never trades with the grid
+        grid_charge = grid_discharge = False
+    return BatteryParams(
+        capacity_kwh=capacity,
+        efficiency=efficiency,
+        max_charge_kwh_per_step=args.max_charge_kw,
+        max_discharge_kwh_per_step=args.max_discharge_kw,
+        allow_grid_charge=grid_charge,
+        allow_grid_discharge=grid_discharge,
+        curtail_negative_export=args.curtail_solar,
+    )
 
 
 def _resolve_tariff(args: argparse.Namespace) -> Tariff | None:
@@ -214,6 +263,11 @@ def _format_summary(summary: Summary) -> str:
             f"Self-sufficiency: {summary.self_sufficiency_without * 100:.1f}% -> "
             f"{summary.self_sufficiency_with * 100:.1f}%"
         )
+    if summary.total_curtailed_kwh > 0:
+        lines.append(
+            f"Solar curtailed:  {summary.total_curtailed_kwh:,.0f} kWh "
+            "(throttled to avoid exporting at a negative price)"
+        )
     return "\n".join(lines)
 
 
@@ -315,6 +369,40 @@ def _format_contract_comparison(costs: CostBreakdown, dyn: DynamicCostBreakdown)
     )
 
 
+def _format_savings_attribution(attr: SavingsAttribution) -> str:
+    lines = [
+        "\nWhere the dynamic saving comes from (vs no battery, no curtailment):",
+        f"  {'Self-consumption (stored solar -> load)':<42}{attr.self_consumption_eur:>10,.2f}",
+        f"  {'Grid arbitrage (cheap grid -> load)':<42}{attr.grid_arbitrage_eur:>10,.2f}",
+        f"  {'Sell-back (battery -> grid)':<42}{attr.sell_back_eur:>10,.2f}",
+    ]
+    if abs(attr.curtailment_eur) >= 0.005:
+        lines.append(f"  {'Solar curtailment (avoided export fee)':<42}{attr.curtailment_eur:>10,.2f}")
+    if abs(attr.unused_end_soc_eur) >= 0.005:
+        lines.append(f"  {'Unused stored energy (end SoC)':<42}{attr.unused_end_soc_eur:>10,.2f}")
+    lines.append(f"  {'Total saving':<42}{attr.total_eur:>10,.2f}  EUR")
+    return "\n".join(lines)
+
+
+def _format_attribution_table(attributions: dict) -> str:
+    show_curtail = any(abs(a.curtailment_eur) >= 0.005 for a in attributions.values())
+    header = f"  {'strategy':<12}{'self-consum':>13}{'grid-arb':>11}{'sell-back':>11}"
+    if show_curtail:
+        header += f"{'curtail':>10}"
+    header += f"{'total':>10}"
+    lines = ["\nSaving by source (EUR, dynamic contract):", header]
+    for name, attr in attributions.items():
+        row = (
+            f"  {name:<12}{attr.self_consumption_eur:>13,.2f}{attr.grid_arbitrage_eur:>11,.2f}"
+            f"{attr.sell_back_eur:>11,.2f}"
+        )
+        if show_curtail:
+            row += f"{attr.curtailment_eur:>10,.2f}"
+        row += f"{attr.total_eur:>10,.2f}"
+        lines.append(row)
+    return "\n".join(lines)
+
+
 def _run(args: argparse.Namespace) -> None:
     input_path = resolve_input_csv(args.input, Path("data"))
     if input_path is None:
@@ -350,23 +438,39 @@ def _run(args: argparse.Namespace) -> None:
     if contract is not None:
         df = add_price_columns(df, prices, contract)
 
+    # Smart strategies, --compare and --curtail-solar all need per-hour prices.
+    needs_prices = args.compare or args.strategy != "reactive" or args.curtail_solar
+    if needs_prices and contract is None:
+        raise CliError(
+            "The threshold/optimal strategies, --compare and --curtail-solar need market "
+            "prices; pass --prices <file> or --fetch-prices."
+        )
+
+    out_dir = Path(args.out) if args.out else input_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.compare:
+        _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract)
+        return
+
+    strategy_name = args.strategy
+    params = _battery_params(args, capacity, efficiency, strategy_name)
     print(
-        f"Simulating {capacity:g} kWh battery at {efficiency * 100:g}% round-trip "
-        f"over {len(df)} hours ..."
+        f"Simulating {capacity:g} kWh battery [{strategy_name}] at {efficiency * 100:g}% "
+        f"round-trip over {len(df)} hours ..."
     )
-    params = BatteryParams(capacity_kwh=capacity, efficiency=efficiency)
     result, summary = simulate_battery(
-        df, params, ReactiveStrategy(), prices=df if contract is not None else None
+        df, params, make_strategy(strategy_name, cycle_cost=args.cycle_cost),
+        prices=df if contract is not None else None,
     )
     energy = split_by_tariff(result)
     costs = compute_costs(energy, tariff) if tariff is not None else None
 
     dynamic = compute_dynamic_costs(result, contract) if contract is not None else None
+    attribution = attribute_savings(result, efficiency) if dynamic is not None else None
     if dynamic is not None:
         result = add_cost_columns(result)
 
-    out_dir = Path(args.out) if args.out else input_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
     stem = _output_stem(input_path, capacity, efficiency)
     csv_path = out_dir / f"{stem}.csv"
     png_path = out_dir / f"{stem}.png"
@@ -379,10 +483,14 @@ def _run(args: argparse.Namespace) -> None:
             {
                 "input": str(input_path),
                 "output_csv": str(csv_path),
+                "strategy": strategy_name,
                 **summary.as_dict(),
                 "energy_by_tariff": energy.as_dict(),
                 "costs": costs.as_dict() if costs is not None else None,
                 "dynamic_costs": dynamic.as_dict() if dynamic is not None else None,
+                "dynamic_savings_attribution": (
+                    attribution.as_dict() if attribution is not None else None
+                ),
             },
             indent=2,
         ),
@@ -397,9 +505,71 @@ def _run(args: argparse.Namespace) -> None:
         print(_format_dynamic_costs(dynamic))
     if costs is not None and dynamic is not None:
         print(_format_contract_comparison(costs, dynamic))
+    if attribution is not None:
+        print(_format_savings_attribution(attribution))
     print(f"\nWrote hourly result to {csv_path}")
     print(f"Chart:   {png_path}")
     print(f"Summary: {summary_path}")
+
+
+def _run_compare(args, df, input_path, out_dir, capacity, efficiency, contract) -> None:
+    """Run all strategies on the same data/prices and report a comparison."""
+    results = {}
+    attributions = {}
+    for name in ("reactive", "threshold", "optimal"):
+        params = _battery_params(args, capacity, efficiency, name)
+        print(f"Simulating [{name}] ...")
+        result, summary = simulate_battery(
+            df, params, make_strategy(name, cycle_cost=args.cycle_cost), prices=df
+        )
+        results[name] = (summary, compute_dynamic_costs(result, contract))
+        attributions[name] = attribute_savings(result, efficiency)
+
+    no_battery = results["reactive"][1].net_without_eur
+    print(_format_strategy_comparison(no_battery, results))
+    print(_format_attribution_table(attributions))
+
+    stem = _output_stem(input_path, capacity, efficiency)
+    out_path = out_dir / f"{stem}.strategies.json"
+    out_path.write_text(
+        json.dumps(
+            {
+                "input": str(input_path),
+                "capacity_kwh": capacity,
+                "efficiency": efficiency,
+                "no_battery_net_eur": round(no_battery, 2),
+                "strategies": {
+                    name: {
+                        "net_with_eur": round(dyn.net_with_eur, 2),
+                        "saving_vs_no_battery_eur": round(no_battery - dyn.net_with_eur, 2),
+                        "grid_charged_kwh": round(summ.total_grid_charged_kwh, 1),
+                        "grid_discharged_kwh": round(summ.total_grid_discharged_kwh, 1),
+                        "saving_attribution": attributions[name].as_dict(),
+                    }
+                    for name, (summ, dyn) in results.items()
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"\nWrote comparison to {out_path}")
+
+
+def _format_strategy_comparison(no_battery: float, results: dict) -> str:
+    best = min(results, key=lambda n: results[n][1].net_with_eur)
+    lines = [
+        "\nBattery strategy comparison (dynamic contract, net cost = import - export):",
+        f"  {'No battery':<12}{no_battery:>12,.2f} EUR",
+        f"  {'strategy':<12}{'net EUR':>12}{'saving':>12}{'grid-charged':>15}",
+    ]
+    for name, (summ, dyn) in results.items():
+        mark = "  <-- best" if name == best else ""
+        lines.append(
+            f"  {name:<12}{dyn.net_with_eur:>12,.2f}{no_battery - dyn.net_with_eur:>12,.2f}"
+            f"{summ.total_grid_charged_kwh:>13,.0f} kWh{mark}"
+        )
+    return "\n".join(lines)
 
 
 def main() -> int:
